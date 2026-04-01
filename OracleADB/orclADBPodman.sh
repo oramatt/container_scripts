@@ -227,8 +227,8 @@ createUser() {
 
     logInfo "Creating database user: ${DB_USER}"
 
-    podman exec -i "${CONTAINER_NAME}" bash -lc "sqlplus admin/"${ADMIN_PASSWORD}"@localhost/myatp" <<EOF
-
+    podman exec -i "${CONTAINER_NAME}" bash -lc "sqlplus -s /nolog" <<EOF
+connect admin/"${ADMIN_PASSWORD}"@localhost/myatp
 whenever sqlerror exit failure
 
 declare
@@ -246,11 +246,22 @@ end;
 /
 grant connect, resource, db_developer_role, pdb_dba, dwrole, console_developer, graph_developer to ${DB_USER};
 alter user ${DB_USER} quota unlimited on data;
+begin
+    ords_admin.enable_schema(
+        p_enabled => true,
+        p_schema => upper('${DB_USER}'),
+        p_url_mapping_type => 'BASE_PATH',
+        p_url_mapping_pattern => lower('${DB_USER}'),
+        p_auto_rest_auth => false
+    );
+    commit;
+end;
+/
 exit
 EOF
 
     if [ $? -eq 0 ]; then
-        logInfo "User ${DB_USER} created or already exists, and grants applied."
+        logInfo "User ${DB_USER} created or already exists, grants applied, quota set, and ORDS enabled."
     else
         logError "Failed to create user ${DB_USER}."
         return 1

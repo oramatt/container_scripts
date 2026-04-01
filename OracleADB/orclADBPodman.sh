@@ -44,7 +44,7 @@
 #   1.0
 ################################################################################
 
-# Copyright (c) 2025 Oracle and/or its affiliates.
+# Copyright (c) 2026 Oracle and/or its affiliates.
 
 # The Universal Permissive License (UPL), Version 1.0
 
@@ -79,6 +79,7 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
+
 set -u
 
 CONTAINER_NAME="adb-free"

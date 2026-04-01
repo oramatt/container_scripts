@@ -170,7 +170,7 @@ showAdminInfo() {
     echo "Database User Pass  : ${DB_USER_PASSWORD}"
     echo
     echo "ORDS URL            : https://localhost:8443/"
-    echo "Listener Port       : 1521 -> container 1522"
+    echo "Listener Port       : 1521 -> container 1521"
     echo "TLS Port            : 1522 -> container 1522"
     echo "MongoDB Port        : 27017"
     echo
@@ -336,7 +336,7 @@ startContainer() {
     fi
 
     logInfo "Launching new ADB-Free container..."
-    countDown "Starting container" 3
+    countDown "Starting container" 15
 
     run_cmd+=(
         "${CONTAINER_PORT_ARGS[@]}"
@@ -357,7 +357,7 @@ startContainer() {
     logInfo "Container started."
     countDown "Waiting for Oracle services to initialize" 10
     listPorts
-    openORDS
+    #openORDS
 }
 
 stopContainer() {

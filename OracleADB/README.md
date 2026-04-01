@@ -27,7 +27,7 @@ Image:
 container-registry.oracle.com/database/adb-free:latest-26ai
 
 Ports:
-- 1521 -> 1522 (SQL)
+- 1521 -> 1521 (SQL)
 - 1522 -> 1522 (TLS)
 - 8443 -> 8443 (ORDS)
 - 27017 -> 27017 (MongoDB API)

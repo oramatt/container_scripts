@@ -48,11 +48,10 @@ Remove:
 
 ## Configuration
 
-ADMIN_PASSWORD="YourStrongPassword123!"
-WALLET_PASSWORD="YourWalletPassword123!"
-DB_USER="youruser"
-DB_USER_PASSWORD="yourpassword"
-ORACLE_PDB="myatp"
+- ADMIN_PASSWORD="YourStrongPassword123!"
+- WALLET_PASSWORD="YourWalletPassword123!"
+- DB_USER="youruser"
+- DB_USER_PASSWORD="yourpassword"
 
 ## Notes
 

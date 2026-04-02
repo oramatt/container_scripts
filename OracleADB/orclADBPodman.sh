@@ -217,6 +217,19 @@ rootAccess() {
     fi
 }
 
+oracleAccess() {
+    requirePodman
+    if containerRunning; then
+        logInfo "Launching oracle shell inside container..."
+        if podman exec -it --user oracle "${CONTAINER_NAME}" /bin/bash 2>/dev/null; then
+            return 0
+        fi
+        podman exec -it --user oracle "${CONTAINER_NAME}" /bin/sh
+    else
+        logError "Container is not running."
+    fi
+}
+
 createUser() {
     requirePodman
 
@@ -291,6 +304,22 @@ sqlPlusUser() {
             exit 1
         fi
     "
+}
+
+copyIn() {
+    requirePodman
+
+    if ! containerRunning; then
+        logError "Oracle container is not running."
+        return 1
+    fi
+
+    read -p "Enter ABSOLUTE PATH to the file to be copied: " thePath
+    read -p "Enter FILE NAME you want copied: " theFile
+
+    logInfo "Copying file: "$thePath/$theFile
+    podman cp $thePath/$theFile $CONTAINER_NAME:/tmp
+
 }
 
 restartContainer() {
@@ -392,6 +421,8 @@ removeContainer() {
     fi
 }
 
+
+
 ################################################################################
 # Menu System
 ################################################################################
@@ -442,8 +473,16 @@ case "${1:-}" in
         rootAccess
         exit 0
         ;;
+    "oracle")
+        oracleAccess
+        exit 0
+        ;;
     "logs")
         showLogs
+        exit 0
+        ;;
+    "copyIn")
+        copyIn
         exit 0
         ;;
     "help"|"-h"|"--help")
@@ -466,9 +505,11 @@ while true; do
     echo -e "\n${GREEN}8. ADB-CLI Shell${NC}"
     echo -e "\n${GREEN}9. Open ORDS${NC}"
     echo -e "\n${GREEN}10. Restart Container${NC}"
-    echo -e "\n${GREEN}11. Root Shell${NC}"
-    echo -e "\n${GREEN}12. Show Logs${NC}"
-    echo -e "\n${YELLOW}13. Quit${NC}"
+    echo -e "\n${GREEN}11. Oracle Shell${NC}"
+    echo -e "\n${GREEN}12. Root Shell${NC}"
+    echo -e "\n${GREEN}13. Show Logs${NC}"
+    echo -e "\n${GREEN}14. Copy in file${NC}"
+    echo -e "\n${YELLOW}15. Quit${NC}"
     echo
 
     read -r -p "Choose an option: " opt
@@ -483,9 +524,11 @@ while true; do
         8) adbCLI ;;
         9) openORDS ;;
         10) restartContainer ;;
-        11) rootAccess ;;
-        12) showLogs ;;
-        13) exit 0 ;;
+        12) rootAccess ;;
+        11) oracleAccess;;
+        13) showLogs ;;
+        14) copyIn ;;
+        15) exit 0 ;;
         *) echo "Invalid choice"; sleep 1 ;;
     esac
 

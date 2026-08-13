@@ -7,7 +7,7 @@
 #   orclADBPodman.sh
 #
 # USAGE:
-#   ./orclADBPodman.sh [pull|start|status|stop|restart|remove|help]
+#   ./orclADBPodman.sh [start|stop|restart|remove|mongoTLS|help]
 #
 # DESCRIPTION:
 #   Wrapper script with both interactive menu and command-line bypass options
@@ -22,6 +22,9 @@
 #   - Remove container
 #   - Interactive menu-driven execution
 #   - Direct command-line bypass support
+#   - Check, enable, or disable ORDS TLS for the Oracle AI Database API for MongoDB
+#   - Compact adaptive two-column interactive menu to reduce terminal scrolling
+#   - Logical menu sections for container, database, shell, and destructive operations
 #
 # REQUIREMENTS:
 #   - Podman installed and available in PATH
@@ -41,7 +44,7 @@
 #   04.01.2026
 #
 # VERSION:
-#   1.0
+#   1.3
 ################################################################################
 
 # Copyright (c) 2026 Oracle and/or its affiliates.
@@ -82,7 +85,7 @@
 
 set -u
 
-CONTAINER_NAME="adb-free"
+CONTAINER_NAME="myadb"
 IMAGE="container-registry.oracle.com/database/adb-free:latest-26ai"
 
 # Required env vars
@@ -181,6 +184,15 @@ showLogs() {
     requirePodman
     if containerExists; then
         podman logs --tail 200 "${CONTAINER_NAME}"
+    else
+        logError "Container does not exist."
+    fi
+}
+
+tailLogs() {
+    requirePodman
+    if containerExists; then
+        podman logs -f --tail 200 "${CONTAINER_NAME}"
     else
         logError "Container does not exist."
     fi
@@ -306,6 +318,31 @@ sqlPlusUser() {
     "
 }
 
+sqlPlusAdmin() {
+    requirePodman
+
+    if ! containerRunning; then
+        logError "Oracle container is not running."
+        return 1
+    fi
+
+    #createUser || return 1
+
+    logInfo "Opening SQL session as Admin..."
+
+    podman exec -it "${CONTAINER_NAME}" bash -lc "
+        source /home/oracle/.bashrc 2>/dev/null || true
+        if command -v sql >/dev/null 2>&1; then
+            sql admin/${DB_USER_PASSWORD}@localhost/myatp
+        elif command -v sqlplus >/dev/null 2>&1; then
+            sqlplus admin/${DB_USER_PASSWORD}@localhost/myatp
+        else
+            echo 'Neither sql nor sqlplus was found inside the container.'
+            exit 1
+        fi
+    "
+}
+
 copyIn() {
     requirePodman
 
@@ -387,6 +424,7 @@ startContainer() {
         --cap-add SYS_ADMIN
         --device /dev/fuse
         --name "${CONTAINER_NAME}"
+        --add-host cloudfs.home.com:192.168.1.191
         "${IMAGE}"
     )
 
@@ -422,6 +460,83 @@ removeContainer() {
 }
 
 
+manageMongoTLS() {
+    requirePodman
+
+    if ! containerRunning; then
+        logError "Oracle container is not running."
+        return 1
+    fi
+
+    local action="${1:-menu}"
+
+    case "${action}" in
+        status|check|info)
+            logInfo "Checking ORDS MongoDB API TLS status..."
+            podman exec --user root "${CONTAINER_NAME}" \
+                ords config info mongo.tls
+            ;;
+
+        enable|on|true)
+            logInfo "Enabling ORDS TLS for the MongoDB API endpoint..."
+            if podman exec --user root "${CONTAINER_NAME}" \
+                ords config set mongo.tls true; then
+                logInfo "ORDS MongoDB API TLS is configured as enabled."
+                podman exec --user root "${CONTAINER_NAME}" \
+                    ords config info mongo.tls
+            else
+                logError "Failed to enable ORDS MongoDB API TLS."
+                return 1
+            fi
+            ;;
+
+        disable|off|false)
+            logInfo "Disabling ORDS TLS for the MongoDB API endpoint..."
+            if podman exec --user root "${CONTAINER_NAME}" \
+                ords config set mongo.tls false; then
+                logInfo "ORDS MongoDB API TLS is configured as disabled."
+                podman exec --user root "${CONTAINER_NAME}" \
+                    ords config info mongo.tls
+            else
+                logError "Failed to disable ORDS MongoDB API TLS."
+                return 1
+            fi
+            ;;
+
+        menu)
+            echo
+            echo -e "${GREEN}ORDS MongoDB API TLS${NC}"
+            echo -e "${GREEN}--------------------${NC}"
+            echo "1. Check TLS status"
+            echo "2. Enable TLS"
+            echo "3. Disable TLS"
+            echo "4. Return to main menu"
+            echo
+
+            local tls_opt
+            read -r -p "Choose an option: " tls_opt
+
+            case "${tls_opt}" in
+                1) manageMongoTLS status ;;
+                2) manageMongoTLS enable ;;
+                3) manageMongoTLS disable ;;
+                4) return 0 ;;
+                *)
+                    logError "Invalid TLS option."
+                    return 1
+                    ;;
+            esac
+            ;;
+
+        *)
+            logError "Invalid MongoDB TLS action: ${action}"
+            echo "Usage: $0 mongoTLS [status|enable|disable]"
+            return 2
+            ;;
+    esac
+}
+
+
 
 ################################################################################
 # Menu System
@@ -447,6 +562,10 @@ case "${1:-}" in
         ;;
     "showAdminInfo")
         showAdminInfo
+        exit 0
+        ;;
+    "sqladmin")
+        sqlPlusAdmin
         exit 0
         ;;
     "sqluser")
@@ -481,54 +600,141 @@ case "${1:-}" in
         showLogs
         exit 0
         ;;
+    "taillogs")
+        tailLogs
+        exit 0
+        ;;
     "copyIn")
         copyIn
         exit 0
         ;;
+    "mongoTLS"|"mongotls"|"mongo-tls")
+        manageMongoTLS "${2:-status}"
+        exit $?
+        ;;
     "help"|"-h"|"--help")
-        echo "Usage: $0 [start|stop|remove|createUser|showAdminInfo|sqluser|ports|adbcli|ords|restart|root|logs]"
+        echo "Usage: $0 [start|stop|remove|createUser|showAdminInfo|sqladmin|sqluser|ports|adbcli|ords|restart|root|oracle|logs|taillogs|copyIn|mongoTLS]"
+        echo
+        echo "MongoDB API TLS:"
+        echo "  $0 mongoTLS status"
+        echo "  $0 mongoTLS enable"
+        echo "  $0 mongoTLS disable"
         exit 0
         ;;
 esac
 
+printMenuRow() {
+    local left_color="$1"
+    local left_text="$2"
+    local right_color="$3"
+    local right_text="$4"
+
+    # Keep ANSI color sequences outside the padded text so printf alignment
+    # is based only on the visible menu text.
+    printf "%b%-38s%b  %b%s%b\n" \
+        "${left_color}" "${left_text}" "${NC}" \
+        "${right_color}" "${right_text}" "${NC}"
+}
+
+printMenuSectionHeader() {
+    local left_title="$1"
+    local right_title="$2"
+
+    printf "%b%-38s%b  %b%s%b\n" \
+        "${GREEN}" "${left_title}" "${NC}" \
+        "${GREEN}" "${right_title}" "${NC}"
+    printf "%-38s  %s\n" \
+        "--------------------" "------------------------"
+}
+
+showMainMenu() {
+    local term_width
+    term_width="$(tput cols 2>/dev/null || printf '80')"
+
+    echo
+    echo -e "${GREEN}Oracle ADB-Free Podman Manager${NC}"
+    echo -e "${GREEN}--------------------------------------------------------------------------------${NC}"
+
+    if [ "${term_width}" -ge 80 ]; then
+        # Group related operations side-by-side for normal terminal widths.
+        printMenuSectionHeader "Container Management" "Oracle AI ADB Management"
+        printMenuRow "${GREEN}"  "1. Start ADB-Free"       "${GREEN}" "9. Show Admin Info"
+        printMenuRow "${YELLOW}" "2. Stop Container"      "${GREEN}" "10. Create Database User"
+        printMenuRow "${GREEN}"  "3. Restart Container"   "${GREEN}" "11. SQL Admin Session"
+        printMenuRow "${GREEN}"  "4. Show Ports"          "${GREEN}" "12. SQL User Session"
+        printMenuRow "${GREEN}"  "5. Show Logs"           "${GREEN}" "13. Open ORDS"
+        printMenuRow "${GREEN}"  "6. Tail Logs"           "${GREEN}" "14. ORDS MongoDB API TLS"
+        printMenuRow "${GREEN}"  "7. Copy in File"        "${GREEN}" ""
+        printMenuRow "${YELLOW}" "8. Quit"                "${GREEN}" ""
+        echo
+
+        printMenuSectionHeader "Shell Access" "Destroy Area"
+        printMenuRow "${GREEN}" "15. Oracle Shell"        "${RED}" "18. Remove Container (DESTROYS ALL DATA)"
+        printMenuRow "${GREEN}" "16. Root Shell"          "${GREEN}" ""
+        printMenuRow "${GREEN}" "17. ADB-CLI Shell"       "${GREEN}" ""
+    else
+        # Compact single-column fallback for narrow terminals.
+        echo -e "${GREEN}Container Management${NC}"
+        echo "--------------------"
+        echo -e "${GREEN}1. Start ADB-Free${NC}"
+        echo -e "${YELLOW}2. Stop Container${NC}"
+        echo -e "${GREEN}3. Restart Container${NC}"
+        echo -e "${GREEN}4. Show Ports${NC}"
+        echo -e "${GREEN}5. Show Logs${NC}"
+        echo -e "${GREEN}6. Tail Logs${NC}"
+        echo -e "${GREEN}7. Copy in File${NC}"
+        echo -e "${YELLOW}8. Quit${NC}"
+        echo
+
+        echo -e "${GREEN}Oracle AI ADB Management${NC}"
+        echo "------------------------"
+        echo -e "${GREEN}9. Show Admin Info${NC}"
+        echo -e "${GREEN}10. Create Database User${NC}"
+        echo -e "${GREEN}11. SQL Admin Session${NC}"
+        echo -e "${GREEN}12. SQL User Session${NC}"
+        echo -e "${GREEN}13. Open ORDS${NC}"
+        echo -e "${GREEN}14. ORDS MongoDB API TLS${NC}"
+        echo
+
+        echo -e "${GREEN}Shell Access${NC}"
+        echo "------------"
+        echo -e "${GREEN}15. Oracle Shell${NC}"
+        echo -e "${GREEN}16. Root Shell${NC}"
+        echo -e "${GREEN}17. ADB-CLI Shell${NC}"
+        echo
+
+        echo -e "${GREEN}Destroy Area${NC}"
+        echo "------------"
+        echo -e "${RED}18. Remove Container (DESTROYS ALL DATA)${NC}"
+    fi
+
+    echo
+}
+
 while true; do
     clear
-    echo -e "\n${GREEN}Oracle ADB-Free Podman Manager${NC}"
-    echo -e "\n${GREEN}--------------------------------${NC}"
-    echo -e "\n${GREEN}1. Start ADB-Free${NC}"
-    echo -e "\n${YELLOW}2. Stop Container${NC}"
-    echo -e "\n${RED}3. Remove Container (DESTROYS ALL DATA)${NC}"
-    echo -e "\n${GREEN}4. Create Database User${NC}"
-    echo -e "\n${GREEN}5. Show Admin Info${NC}"
-    echo -e "\n${GREEN}6. SQL User Session${NC}"
-    echo -e "\n${GREEN}7. Show Ports${NC}"
-    echo -e "\n${GREEN}8. ADB-CLI Shell${NC}"
-    echo -e "\n${GREEN}9. Open ORDS${NC}"
-    echo -e "\n${GREEN}10. Restart Container${NC}"
-    echo -e "\n${GREEN}11. Oracle Shell${NC}"
-    echo -e "\n${GREEN}12. Root Shell${NC}"
-    echo -e "\n${GREEN}13. Show Logs${NC}"
-    echo -e "\n${GREEN}14. Copy in file${NC}"
-    echo -e "\n${YELLOW}15. Quit${NC}"
-    echo
+    showMainMenu
 
     read -r -p "Choose an option: " opt
     case "$opt" in
         1) startContainer ;;
         2) stopContainer ;;
-        3) removeContainer ;;
-        4) createUser ;;
-        5) showAdminInfo ;;
-        6) sqlPlusUser ;;
-        7) listPorts ;;
-        8) adbCLI ;;
-        9) openORDS ;;
-        10) restartContainer ;;
-        12) rootAccess ;;
-        11) oracleAccess;;
-        13) showLogs ;;
-        14) copyIn ;;
-        15) exit 0 ;;
+        3) restartContainer ;;
+        4) listPorts ;;
+        5) showLogs ;;
+        6) tailLogs ;;
+        7) copyIn ;;
+        8) exit 0 ;;
+        9) showAdminInfo ;;
+        10) createUser ;;
+        11) sqlPlusAdmin ;;
+        12) sqlPlusUser ;;
+        13) openORDS ;;
+        14) manageMongoTLS ;;
+        15) oracleAccess ;;
+        16) rootAccess ;;
+        17) adbCLI ;;
+        18) removeContainer ;;
         *) echo "Invalid choice"; sleep 1 ;;
     esac
 

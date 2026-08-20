@@ -32,6 +32,9 @@
 #   - Test the Oracle-facing S3-compatible endpoint from the shared network
 #   - Attach an existing Oracle ADB container to the shared data-lake network
 #   - Install the generated local CA in an attached Oracle container OS truststore
+#   - Default Oracle integration to the myadb container created by orclADBPodman.sh
+#   - Expose the local CA through the TLS proxy for cross-script trust synchronization
+#   - Auto-connect a running Oracle ADB container when the Spark stack starts
 #
 # REQUIREMENTS:
 #   - Bash 4 or later
@@ -63,7 +66,7 @@
 #   08.20.2026
 #
 # VERSION:
-#   1.1.0
+#   1.2.0
 ################################################################################
 
 # Copyright (c) 2026 Matt DeMarco.
@@ -104,7 +107,7 @@
 
 set -u
 
-SCRIPT_VERSION="1.1.0"
+SCRIPT_VERSION="1.2.0"
 REPOSITORY_URL="${SPARK_ICEBERG_REPOSITORY_URL:-https://github.com/databricks/docker-spark-iceberg.git}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -134,7 +137,7 @@ DATALAKE_NETWORK="${SPARK_ICEBERG_NETWORK:-oracle-datalake}"
 MINIO_VOLUME_NAME="${SPARK_ICEBERG_MINIO_VOLUME:-spark-iceberg-minio-data}"
 MINIO_TLS_IMAGE="${SPARK_ICEBERG_TLS_PROXY_IMAGE:-nginx:alpine}"
 MINIO_MC_IMAGE="${SPARK_ICEBERG_MC_IMAGE:-minio/mc:latest}"
-ORACLE_CONTAINER_DEFAULT="${ORACLE_ADB_CONTAINER:-}"
+ORACLE_CONTAINER_DEFAULT="${ORACLE_ADB_CONTAINER:-myadb}"
 
 # These match the upstream Databricks Spark + Iceberg quickstart defaults.
 MINIO_ACCESS_KEY="admin"
@@ -143,6 +146,7 @@ MINIO_BUCKET="warehouse"
 MINIO_INTERNAL_HOST="minio"
 MINIO_ORACLE_HOST="warehouse.minio"
 MINIO_ORACLE_ROOT_HOST="minio"
+MINIO_TLS_CA_CONTAINER_PATH="/etc/nginx/tls/ca.crt"
 
 JUPYTER_URL="http://localhost:8888"
 SPARK_UI_URL="http://localhost:8080"
@@ -406,6 +410,7 @@ services:
       - ./.oracle-datalake/nginx.conf:/etc/nginx/nginx.conf:ro
       - ./.oracle-datalake/tls/server.crt:/etc/nginx/tls/server.crt:ro
       - ./.oracle-datalake/tls/server.key:/etc/nginx/tls/server.key:ro
+      - ./.oracle-datalake/tls/ca.crt:${MINIO_TLS_CA_CONTAINER_PATH}:ro
     networks:
       iceberg_net:
       oracle-datalake:
@@ -474,6 +479,34 @@ install_project() {
     success "Oracle data-lake integration assets are configured."
 }
 
+auto_connect_oracle_container() {
+    local container_name="${ORACLE_CONTAINER_DEFAULT}"
+
+    [[ -n "${container_name}" ]] || return 0
+
+    if ! "${RUNTIME}" inspect "${container_name}" >/dev/null 2>&1; then
+        if [[ "${RUNTIME}" != "podman" ]] && command -v podman >/dev/null 2>&1 && \
+           podman inspect "${container_name}" >/dev/null 2>&1; then
+            warn "Oracle container ${container_name} exists in Podman, but Spark is using ${RUNTIME}."
+            warn "The two scripts must use the same container runtime. Re-run with CONTAINER_ENGINE=podman."
+        fi
+        return 0
+    fi
+
+    if [[ "$("${RUNTIME}" inspect -f '{{.State.Running}}' "${container_name}" 2>/dev/null)" != "true" ]]; then
+        warn "Oracle container ${container_name} exists but is not running; skipping automatic data-lake attachment."
+        return 0
+    fi
+
+    info "Detected running Oracle ADB container ${container_name}; validating shared data-lake integration."
+    if ! connect_oracle_container "${container_name}"; then
+        warn "Spark + Iceberg started, but automatic Oracle data-lake integration was not completed."
+        warn "Retry with: $(basename "$0") connectoracle ${container_name}"
+    fi
+
+    return 0
+}
+
 start_stack() {
     runtime_ready || return 1
     ensure_project || return 1
@@ -483,6 +516,7 @@ start_stack() {
     info "Starting the Spark + Iceberg environment with ${COMPOSE_CMD[*]}"
     compose up -d || return 1
     success "Spark + Iceberg environment started."
+    auto_connect_oracle_container
     show_endpoints
 }
 
@@ -629,7 +663,10 @@ TLS
   Server certificate:   ${SERVER_CERT_FILE}
 
 Oracle container attachment
-  $(basename "$0") connectoracle <oracle-container-name>
+  Default container:     ${ORACLE_CONTAINER_DEFAULT}
+  $(basename "$0") connectoracle [oracle-container-name]
+  The matching orclADBPodman.sh can also join ${DATALAKE_NETWORK} directly
+  and read the CA from the running ${MINIO_TLS_SERVICE} container.
 
 Example DBMS_CLOUD object URI
   ${MINIO_ORACLE_S3_PREFIX}oracle-export/customers.parquet
@@ -842,7 +879,13 @@ connect_oracle_container() {
     fi
 
     if ! "${RUNTIME}" inspect "${container_name}" >/dev/null 2>&1; then
-        error "Container not found in ${RUNTIME}: ${container_name}"
+        if [[ "${RUNTIME}" != "podman" ]] && command -v podman >/dev/null 2>&1 && \
+           podman inspect "${container_name}" >/dev/null 2>&1; then
+            error "Container ${container_name} exists in Podman, but Spark is using ${RUNTIME}."
+            error "Use the same runtime for both stacks, for example: CONTAINER_ENGINE=podman $0 connectoracle ${container_name}"
+        else
+            error "Container not found in ${RUNTIME}: ${container_name}"
+        fi
         return 1
     fi
 
@@ -944,6 +987,7 @@ doctor() {
     printf '  Shared network:      %s\n' "${DATALAKE_NETWORK}"
     printf '  MinIO data volume:   %s\n' "${MINIO_VOLUME_NAME}"
     printf '  Oracle S3 hostname:  %s\n' "${MINIO_ORACLE_HOST}"
+    printf '  Oracle container:    %s\n' "${ORACLE_CONTAINER_DEFAULT}"
 
     if detect_runtime; then
         printf '  Runtime:             %s\n' "${RUNTIME}"
@@ -1081,7 +1125,7 @@ Commands:
   health                  Check host endpoints and Oracle-facing S3 access
   s3info                  Show MinIO/S3 and Oracle container connection details
   tests3                  Test HTTPS/S3 access through the shared network
-  connectoracle <name>    Attach an Oracle ADB container and install the local CA
+  connectoracle [name]      Attach Oracle ADB (default: myadb) and install the local CA
   cainfo                  Show the generated local CA details
   regeneratetls           Regenerate the local CA and TLS server certificate
   shell                   Open Bash in the Spark container
@@ -1101,7 +1145,7 @@ Environment variables:
   SPARK_ICEBERG_MINIO_VOLUME    Named MinIO data volume
   SPARK_ICEBERG_TLS_PROXY_IMAGE TLS proxy image (default: nginx:alpine)
   SPARK_ICEBERG_MC_IMAGE        MinIO client image (default: minio/mc:latest)
-  ORACLE_ADB_CONTAINER          Default Oracle ADB container for connectoracle
+  ORACLE_ADB_CONTAINER          Oracle ADB container (default: myadb)
   CONTAINER_ENGINE              Force 'docker' or 'podman'
 
 Examples:

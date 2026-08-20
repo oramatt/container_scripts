@@ -7,7 +7,7 @@
 #   orclADBPodman.sh
 #
 # USAGE:
-#   ./orclADBPodman.sh [start|stop|restart|remove|mongoTLS|help]
+#   ./orclADBPodman.sh [start|stop|restart|remove|mongoTLS|datalake|datalakeDB|help]
 #
 # DESCRIPTION:
 #   Wrapper script with both interactive menu and command-line bypass options
@@ -24,18 +24,28 @@
 #   - Direct command-line bypass support
 #   - Check, enable, or disable ORDS TLS for the Oracle AI Database API for MongoDB
 #   - Compact adaptive two-column interactive menu to reduce terminal scrolling
-#   - Logical menu sections for container, database, shell, and destructive operations
+#   - Logical menu sections for container, database, shell, data lake, and destructive operations
+#   - Create or reuse the shared oracle-datalake container network
+#   - Start and restart ADB-Free attached to the Spark/MinIO shared network
+#   - Synchronize the MinIO local CA directly from the minio-s3-tls container
+#   - Test Oracle-container DNS and HTTPS connectivity to MinIO
+#   - Configure a DBMS_CLOUD S3 credential and network ACL for the application user
+#   - Test DBMS_CLOUD object listing against the MinIO warehouse bucket
 #
 # REQUIREMENTS:
 #   - Podman installed and available in PATH
 #   - Internet connectivity for initial image pull
 #   - Acceptance of Oracle container registry license terms
 #   - Valid Oracle Container Registry credentials if required
+#   - sparkIcebergManager.sh v1.2.0 or later for automatic MinIO/TLS integration
 #
 # NOTES:
 #   - Intended for testing Oracle Autonomous AI Database Free
 #   - Review port mappings, volume mounts, and environment variables before use
 #   - Persistent storage should be configured if container data must survive removal
+#   - MinIO remains the authoritative object store; no host filesystem or NFS bridge is used
+#   - The shared data-lake network defaults to oracle-datalake
+#   - The Oracle-facing MinIO endpoint defaults to https://warehouse.minio:443
 #
 # AUTHOR:
 #   Matt DeMarco (matthew.demarco@oracle.com)
@@ -44,7 +54,7 @@
 #   04.01.2026
 #
 # VERSION:
-#   1.3
+#   1.4.0
 ################################################################################
 
 # Copyright (c) 2026 Oracle and/or its affiliates.
@@ -97,6 +107,22 @@ WORKLOAD_TYPE="ATP"   # ATP or ADW
 DB_USER="matt"
 DB_USER_PASSWORD="Welcome1234!"
 
+SCRIPT_VERSION="1.4.0"
+
+# Spark / Iceberg / MinIO data-lake integration
+# These defaults intentionally match sparkIcebergManager.sh.
+DATALAKE_NETWORK="${ORACLE_DATALAKE_NETWORK:-${SPARK_ICEBERG_NETWORK:-oracle-datalake}}"
+DATALAKE_TLS_CONTAINER="${ORACLE_DATALAKE_TLS_CONTAINER:-minio-s3-tls}"
+DATALAKE_S3_ROOT_HOST="${ORACLE_DATALAKE_S3_ROOT_HOST:-minio}"
+DATALAKE_S3_HOST="${ORACLE_DATALAKE_S3_HOST:-warehouse.minio}"
+DATALAKE_BUCKET="${ORACLE_DATALAKE_BUCKET:-warehouse}"
+DATALAKE_ACCESS_KEY="${ORACLE_DATALAKE_ACCESS_KEY:-admin}"
+DATALAKE_SECRET_KEY="${ORACLE_DATALAKE_SECRET_KEY:-password}"
+DATALAKE_CREDENTIAL="${ORACLE_DATALAKE_CREDENTIAL:-DATALAKE_S3_CRED}"
+DATALAKE_CA_PROXY_PATH="${ORACLE_DATALAKE_CA_PROXY_PATH:-/etc/nginx/tls/ca.crt}"
+DATALAKE_CA_TMP_PATH="/tmp/oracle-datalake-ca.crt"
+DATALAKE_CA_CONTAINER_PATH="/etc/pki/ca-trust/source/anchors/oracle-datalake-ca.crt"
+
 # Uncomment on Apple Silicon / ARM if needed
 # PLATFORM="linux/amd64"
 
@@ -123,6 +149,287 @@ requirePodman() {
         logError "podman is not installed or not in PATH."
         exit 1
     fi
+}
+
+ensureDataLakeNetwork() {
+    requirePodman
+
+    if podman network inspect "${DATALAKE_NETWORK}" >/dev/null 2>&1; then
+        return 0
+    fi
+
+    logInfo "Creating shared data-lake network: ${DATALAKE_NETWORK}"
+    if podman network create "${DATALAKE_NETWORK}" >/dev/null; then
+        logInfo "Shared data-lake network created."
+    else
+        logError "Failed to create shared data-lake network: ${DATALAKE_NETWORK}"
+        return 1
+    fi
+}
+
+containerOnDataLakeNetwork() {
+    local networks_json
+
+    containerExists || return 1
+    networks_json="$(podman inspect -f '{{json .NetworkSettings.Networks}}' "${CONTAINER_NAME}" 2>/dev/null)" || return 1
+    [[ "${networks_json}" == *\"${DATALAKE_NETWORK}\"* ]]
+}
+
+connectDataLakeNetwork() {
+    requirePodman
+    ensureDataLakeNetwork || return 1
+
+    if ! containerExists; then
+        logWarn "Oracle container does not exist yet; it will join ${DATALAKE_NETWORK} when created."
+        return 0
+    fi
+
+    if containerOnDataLakeNetwork; then
+        logInfo "${CONTAINER_NAME} is already attached to ${DATALAKE_NETWORK}."
+        return 0
+    fi
+
+    logInfo "Attaching ${CONTAINER_NAME} to ${DATALAKE_NETWORK}..."
+    if podman network connect "${DATALAKE_NETWORK}" "${CONTAINER_NAME}"; then
+        logInfo "${CONTAINER_NAME} attached to ${DATALAKE_NETWORK}."
+    else
+        logError "Failed to attach ${CONTAINER_NAME} to ${DATALAKE_NETWORK}."
+        return 1
+    fi
+}
+
+dataLakeTLSContainerRunning() {
+    podman ps --format "{{.Names}}" | grep -q "^${DATALAKE_TLS_CONTAINER}$"
+}
+
+syncDataLakeCA() {
+    requirePodman
+
+    if ! containerRunning; then
+        logError "Oracle container is not running."
+        return 1
+    fi
+
+    if ! dataLakeTLSContainerRunning; then
+        logWarn "${DATALAKE_TLS_CONTAINER} is not running; MinIO CA synchronization is deferred."
+        logWarn "Start sparkIcebergManager.sh, then run: $0 datalake"
+        return 1
+    fi
+
+    logInfo "Synchronizing MinIO CA from ${DATALAKE_TLS_CONTAINER} into ${CONTAINER_NAME}."
+
+    if ! podman exec "${DATALAKE_TLS_CONTAINER}" sh -lc \
+        "test -r '${DATALAKE_CA_PROXY_PATH}'"; then
+        logError "CA certificate not found in ${DATALAKE_TLS_CONTAINER}: ${DATALAKE_CA_PROXY_PATH}"
+        return 1
+    fi
+
+    if ! podman exec "${DATALAKE_TLS_CONTAINER}" cat "${DATALAKE_CA_PROXY_PATH}" | \
+         podman exec -i --user 0 "${CONTAINER_NAME}" sh -lc \
+         "cat > '${DATALAKE_CA_TMP_PATH}'"; then
+        logError "Failed to copy the MinIO CA between containers."
+        return 1
+    fi
+
+    if podman exec --user 0 "${CONTAINER_NAME}" sh -lc \
+        'command -v update-ca-trust >/dev/null 2>&1'; then
+        if podman exec --user 0 "${CONTAINER_NAME}" sh -lc \
+            "cp '${DATALAKE_CA_TMP_PATH}' '${DATALAKE_CA_CONTAINER_PATH}' && update-ca-trust"; then
+            logInfo "MinIO CA installed in the Oracle container OS truststore."
+        else
+            logError "Failed to update the Oracle container OS truststore."
+            return 1
+        fi
+    else
+        logWarn "update-ca-trust is unavailable; CA remains at ${DATALAKE_CA_TMP_PATH}."
+        return 1
+    fi
+}
+
+showDataLakeInfo() {
+    echo
+    echo "Oracle / Spark Data Lake Integration"
+    echo "------------------------------------"
+    echo "Oracle Container       : ${CONTAINER_NAME}"
+    echo "Shared Network         : ${DATALAKE_NETWORK}"
+    echo "TLS Proxy Container    : ${DATALAKE_TLS_CONTAINER}"
+    echo "S3 Root Host           : https://${DATALAKE_S3_ROOT_HOST}:443"
+    echo "S3 Bucket Host         : https://${DATALAKE_S3_HOST}:443"
+    echo "DBMS_CLOUD URI         : s3://${DATALAKE_S3_HOST}/<object-name>"
+    echo "Bucket                 : ${DATALAKE_BUCKET}"
+    echo "Access Key             : ${DATALAKE_ACCESS_KEY}"
+    echo "Secret Key             : ${DATALAKE_SECRET_KEY}"
+    echo "DBMS_CLOUD Credential  : ${DATALAKE_CREDENTIAL}"
+    echo "CA Trust Path          : ${DATALAKE_CA_CONTAINER_PATH}"
+    echo
+}
+
+testDataLakeConnection() {
+    requirePodman
+
+    if ! containerRunning; then
+        logError "Oracle container is not running."
+        return 1
+    fi
+
+    local failed=0
+
+    if podman exec "${CONTAINER_NAME}" sh -lc \
+        "getent hosts '${DATALAKE_S3_ROOT_HOST}' >/dev/null 2>&1"; then
+        logInfo "DNS resolves ${DATALAKE_S3_ROOT_HOST}."
+    else
+        logError "DNS does not resolve ${DATALAKE_S3_ROOT_HOST}."
+        failed=1
+    fi
+
+    if podman exec "${CONTAINER_NAME}" sh -lc \
+        "getent hosts '${DATALAKE_S3_HOST}' >/dev/null 2>&1"; then
+        logInfo "DNS resolves ${DATALAKE_S3_HOST}."
+    else
+        logError "DNS does not resolve ${DATALAKE_S3_HOST}."
+        failed=1
+    fi
+
+    if podman exec "${CONTAINER_NAME}" sh -lc 'command -v curl >/dev/null 2>&1'; then
+        if podman exec "${CONTAINER_NAME}" sh -lc \
+            "curl --silent --show-error --fail --max-time 10 --cacert '${DATALAKE_CA_CONTAINER_PATH}' 'https://${DATALAKE_S3_ROOT_HOST}/minio/health/live' >/dev/null"; then
+            logInfo "Trusted HTTPS connection to the MinIO health endpoint succeeded."
+        else
+            logError "Trusted HTTPS connection to MinIO failed."
+            failed=1
+        fi
+
+        # A request to the bucket host may return an application-level HTTP status,
+        # but curl still verifies DNS and TLS when --fail is omitted.
+        if podman exec "${CONTAINER_NAME}" sh -lc \
+            "curl --silent --show-error --max-time 10 --cacert '${DATALAKE_CA_CONTAINER_PATH}' -o /dev/null 'https://${DATALAKE_S3_HOST}/'"; then
+            logInfo "TLS validation for the virtual-hosted bucket endpoint succeeded."
+        else
+            logError "TLS validation for ${DATALAKE_S3_HOST} failed."
+            failed=1
+        fi
+    else
+        logWarn "curl is not available inside ${CONTAINER_NAME}; skipped HTTPS validation."
+    fi
+
+    return "${failed}"
+}
+
+configureDataLakeConnection() {
+    requirePodman
+    ensureDataLakeNetwork || return 1
+    connectDataLakeNetwork || return 1
+
+    if ! containerRunning; then
+        logWarn "Oracle container is not running; network configuration is ready."
+        return 0
+    fi
+
+    syncDataLakeCA || return 1
+    testDataLakeConnection
+}
+
+configureDataLakeDatabase() {
+    requirePodman
+
+    if ! containerRunning; then
+        logError "Oracle container is not running."
+        return 1
+    fi
+
+    configureDataLakeConnection || return 1
+    createUser || return 1
+
+    logInfo "Granting ${DB_USER} HTTPS access to ${DATALAKE_S3_HOST}."
+
+    if ! podman exec -i "${CONTAINER_NAME}" bash -lc "sqlplus -s /nolog" <<EOF
+connect admin/"${ADMIN_PASSWORD}"@localhost/myatp
+whenever sqlerror exit failure
+
+begin
+    DBMS_NETWORK_ACL_ADMIN.APPEND_HOST_ACE(
+        host => '${DATALAKE_S3_HOST}',
+        ace  => xs\$ace_type(
+                    privilege_list => xs\$name_list('http'),
+                    principal_name => upper('${DB_USER}'),
+                    principal_type => xs_acl.ptype_db
+                ),
+        private_target => TRUE
+    );
+exception
+    when others then
+        if sqlcode != -24243 then
+            raise;
+        end if;
+end;
+/
+exit
+EOF
+    then
+        logError "Failed to configure the database network ACL."
+        return 1
+    fi
+
+    logInfo "Creating or refreshing ${DATALAKE_CREDENTIAL} for ${DB_USER}."
+
+    if ! podman exec -i "${CONTAINER_NAME}" bash -lc "sqlplus -s /nolog" <<EOF
+connect ${DB_USER}/"${DB_USER_PASSWORD}"@localhost/myatp
+whenever sqlerror exit failure
+
+declare
+    v_count number;
+begin
+    select count(*)
+      into v_count
+      from user_credentials
+     where credential_name = upper('${DATALAKE_CREDENTIAL}');
+
+    if v_count > 0 then
+        DBMS_CLOUD.DROP_CREDENTIAL('${DATALAKE_CREDENTIAL}');
+    end if;
+
+    DBMS_CLOUD.CREATE_CREDENTIAL(
+        credential_name => '${DATALAKE_CREDENTIAL}',
+        username        => '${DATALAKE_ACCESS_KEY}',
+        password        => '${DATALAKE_SECRET_KEY}'
+    );
+end;
+/
+
+set pagesize 100
+set linesize 200
+column object_name format a100
+select object_name, bytes
+  from DBMS_CLOUD.LIST_OBJECTS(
+           '${DATALAKE_CREDENTIAL}',
+           's3://${DATALAKE_S3_HOST}/'
+       )
+ fetch first 20 rows only;
+
+exit
+EOF
+    then
+        logError "DBMS_CLOUD MinIO configuration or object listing failed."
+        logWarn "Container networking and OS TLS may still be correct; inspect the database error above."
+        return 1
+    fi
+
+    logInfo "DBMS_CLOUD successfully authenticated to the MinIO ${DATALAKE_BUCKET} bucket."
+}
+
+autoConfigureDataLake() {
+    ensureDataLakeNetwork || return 1
+    connectDataLakeNetwork || return 1
+
+    if containerRunning && dataLakeTLSContainerRunning; then
+        if syncDataLakeCA; then
+            testDataLakeConnection || logWarn "Data-lake network is attached, but connectivity validation reported an issue."
+        fi
+    elif containerRunning; then
+        logInfo "Data-lake network is attached. Start sparkIcebergManager.sh to enable MinIO TLS/CA synchronization."
+    fi
+
+    return 0
 }
 
 getContainerId() {
@@ -177,6 +484,11 @@ showAdminInfo() {
     echo "Listener Port       : 1521 -> container 1521"
     echo "TLS Port            : 1522 -> container 1522"
     echo "MongoDB Port        : 27017"
+    echo
+    echo "Data Lake Network   : ${DATALAKE_NETWORK}"
+    echo "MinIO S3 Host       : https://${DATALAKE_S3_HOST}:443"
+    echo "MinIO Bucket        : ${DATALAKE_BUCKET}"
+    echo "DBMS_CLOUD URI      : s3://${DATALAKE_S3_HOST}/<object-name>"
     echo
 }
 
@@ -333,9 +645,9 @@ sqlPlusAdmin() {
     podman exec -it "${CONTAINER_NAME}" bash -lc "
         source /home/oracle/.bashrc 2>/dev/null || true
         if command -v sql >/dev/null 2>&1; then
-            sql admin/${DB_USER_PASSWORD}@localhost/myatp
+            sql admin/${ADMIN_PASSWORD}@localhost/myatp
         elif command -v sqlplus >/dev/null 2>&1; then
-            sqlplus admin/${DB_USER_PASSWORD}@localhost/myatp
+            sqlplus admin/${ADMIN_PASSWORD}@localhost/myatp
         else
             echo 'Neither sql nor sqlplus was found inside the container.'
             exit 1
@@ -354,20 +666,24 @@ copyIn() {
     read -p "Enter ABSOLUTE PATH to the file to be copied: " thePath
     read -p "Enter FILE NAME you want copied: " theFile
 
-    logInfo "Copying file: "$thePath/$theFile
-    podman cp $thePath/$theFile $CONTAINER_NAME:/tmp
+    logInfo "Copying file: ${thePath}/${theFile}"
+    podman cp "${thePath}/${theFile}" "${CONTAINER_NAME}:/tmp"
 
 }
 
 restartContainer() {
     requirePodman
+    ensureDataLakeNetwork || return 1
+
     if containerExists; then
+        connectDataLakeNetwork || return 1
         logInfo "Restarting container..."
         if ! podman restart "${CONTAINER_NAME}"; then
             logError "Failed to restart container."
             return 1
         fi
         countDown "Waiting for Oracle services to come up" 10
+        autoConfigureDataLake
         listPorts
         openORDS
     else
@@ -377,21 +693,25 @@ restartContainer() {
 
 startContainer() {
     requirePodman
+    ensureDataLakeNetwork || return 1
 
     if containerRunning; then
         logWarn "Container already running."
+        autoConfigureDataLake
         listPorts
         #openORDS
         return 0
     fi
 
     if containerExists; then
+        connectDataLakeNetwork || return 1
         logInfo "Existing container found. Restarting..."
         if ! podman restart "${CONTAINER_NAME}"; then
             logError "Failed to restart container."
             return 1
         fi
         countDown "Waiting for Oracle services to come up" 10
+        autoConfigureDataLake
         listPorts
         #openORDS
         return 0
@@ -424,6 +744,7 @@ startContainer() {
         --cap-add SYS_ADMIN
         --device /dev/fuse
         --name "${CONTAINER_NAME}"
+        --network "${DATALAKE_NETWORK}"
         --add-host cloudfs.home.com:192.168.1.191
         "${IMAGE}"
     )
@@ -435,6 +756,7 @@ startContainer() {
 
     logInfo "Container started."
     countDown "Waiting for Oracle services to initialize" 10
+    autoConfigureDataLake
     listPorts
     #openORDS
 }
@@ -612,13 +934,46 @@ case "${1:-}" in
         manageMongoTLS "${2:-status}"
         exit $?
         ;;
+    "datalake"|"datalakeConnect")
+        configureDataLakeConnection
+        exit $?
+        ;;
+    "datalakeInfo")
+        showDataLakeInfo
+        exit 0
+        ;;
+    "datalakeTest")
+        testDataLakeConnection
+        exit $?
+        ;;
+    "datalakeCA")
+        syncDataLakeCA
+        exit $?
+        ;;
+    "datalakeDB")
+        configureDataLakeDatabase
+        exit $?
+        ;;
     "help"|"-h"|"--help")
-        echo "Usage: $0 [start|stop|remove|createUser|showAdminInfo|sqladmin|sqluser|ports|adbcli|ords|restart|root|oracle|logs|taillogs|copyIn|mongoTLS]"
+        echo "Usage: $0 [start|stop|restart|remove|createUser|showAdminInfo|sqladmin|sqluser|ports|adbcli|ords|root|oracle|logs|taillogs|copyIn|mongoTLS|datalake|datalakeDB]"
         echo
         echo "MongoDB API TLS:"
         echo "  $0 mongoTLS status"
         echo "  $0 mongoTLS enable"
         echo "  $0 mongoTLS disable"
+        echo
+        echo "Spark / MinIO data lake:"
+        echo "  $0 datalake        # join network, sync CA, test HTTPS"
+        echo "  $0 datalakeInfo    # show shared network and S3 details"
+        echo "  $0 datalakeTest    # test DNS and trusted HTTPS from Oracle"
+        echo "  $0 datalakeCA      # refresh MinIO CA from minio-s3-tls"
+        echo "  $0 datalakeDB      # configure DBMS_CLOUD credential/ACL and list objects"
+        echo
+        echo "Environment overrides:"
+        echo "  ORACLE_DATALAKE_NETWORK, ORACLE_DATALAKE_TLS_CONTAINER"
+        echo "  ORACLE_DATALAKE_S3_ROOT_HOST, ORACLE_DATALAKE_S3_HOST"
+        echo "  ORACLE_DATALAKE_BUCKET, ORACLE_DATALAKE_S3_ACCESS_KEY"
+        echo "  ORACLE_DATALAKE_S3_SECRET_KEY, ORACLE_DATALAKE_CREDENTIAL"
         exit 0
         ;;
 esac
@@ -668,10 +1023,14 @@ showMainMenu() {
         printMenuRow "${YELLOW}" "8. Quit"                "${GREEN}" ""
         echo
 
-        printMenuSectionHeader "Shell Access" "Destroy Area"
-        printMenuRow "${GREEN}" "15. Oracle Shell"        "${RED}" "18. Remove Container (DESTROYS ALL DATA)"
-        printMenuRow "${GREEN}" "16. Root Shell"          "${GREEN}" ""
-        printMenuRow "${GREEN}" "17. ADB-CLI Shell"       "${GREEN}" ""
+        printMenuSectionHeader "Shell Access" "Data Lake / MinIO"
+        printMenuRow "${GREEN}" "15. Oracle Shell"        "${GREEN}" "18. Show Data Lake Info"
+        printMenuRow "${GREEN}" "16. Root Shell"          "${GREEN}" "19. Connect / Refresh Data Lake"
+        printMenuRow "${GREEN}" "17. ADB-CLI Shell"       "${GREEN}" "20. Test Data Lake Connectivity"
+        printMenuRow "${GREEN}" ""                        "${GREEN}" "21. Configure DBMS_CLOUD"
+        echo
+        printMenuSectionHeader "Destroy Area" ""
+        printMenuRow "${RED}" "22. Remove Container (DESTROYS ALL DATA)" "${GREEN}" ""
     else
         # Compact single-column fallback for narrow terminals.
         echo -e "${GREEN}Container Management${NC}"
@@ -703,9 +1062,17 @@ showMainMenu() {
         echo -e "${GREEN}17. ADB-CLI Shell${NC}"
         echo
 
+        echo -e "${GREEN}Data Lake / MinIO${NC}"
+        echo "-----------------"
+        echo -e "${GREEN}18. Show Data Lake Info${NC}"
+        echo -e "${GREEN}19. Connect / Refresh Data Lake${NC}"
+        echo -e "${GREEN}20. Test Data Lake Connectivity${NC}"
+        echo -e "${GREEN}21. Configure DBMS_CLOUD${NC}"
+        echo
+
         echo -e "${GREEN}Destroy Area${NC}"
         echo "------------"
-        echo -e "${RED}18. Remove Container (DESTROYS ALL DATA)${NC}"
+        echo -e "${RED}22. Remove Container (DESTROYS ALL DATA)${NC}"
     fi
 
     echo
@@ -734,7 +1101,11 @@ while true; do
         15) oracleAccess ;;
         16) rootAccess ;;
         17) adbCLI ;;
-        18) removeContainer ;;
+        18) showDataLakeInfo ;;
+        19) configureDataLakeConnection ;;
+        20) testDataLakeConnection ;;
+        21) configureDataLakeDatabase ;;
+        22) removeContainer ;;
         *) echo "Invalid choice"; sleep 1 ;;
     esac
 

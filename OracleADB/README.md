@@ -165,7 +165,7 @@ Use a platform override only when specifically required.
 | Workload type | `ATP` |
 | Admin password | `Welcome1234!` |
 | Wallet password | `Welcome1234!` |
-| Application user | `workbench` |
+| Application user | `matt` |
 | Application-user password | `Welcome1234!` |
 | Shared data-lake network | `oracle-datalake` |
 | MinIO TLS proxy | `minio-s3-tls` |

@@ -32,6 +32,7 @@ Major capabilities include:
 - Create or reuse a shared `oracle-datalake` Podman network.
 - Integrate with `sparkIcebergManager.sh` and its MinIO S3-compatible object store.
 - Synchronize the local MinIO CA from the `minio-s3-tls` container.
+- Synchronize the DBMS_CLOUD SSL wallet used by database-managed outbound HTTPS requests.
 - Test DNS and trusted HTTPS connectivity from the ADB container to MinIO.
 - Configure a `DBMS_CLOUD` credential and network ACL for MinIO.
 - Execute a real `DBMS_CLOUD.LIST_OBJECTS` request against the shared `warehouse` bucket.
@@ -175,6 +176,8 @@ Use a platform override only when specifically required.
 | MinIO access key | `admin` |
 | MinIO secret key | `password` |
 | DBMS_CLOUD credential | `DATALAKE_S3_CRED` |
+| DBMS_CLOUD SSL wallet | `/u01/app/oracle/wallets/ssl_wallet` |
+| DBMS_CLOUD wallet mode | `replace` |
 
 These are development defaults. Change credentials before using the script anywhere other than an isolated local lab.
 
@@ -348,7 +351,7 @@ The menu is organized into:
 The default application user is:
 
 ```text
-workbench
+matt
 ```
 
 Create or refresh the user configuration:
@@ -536,6 +539,7 @@ This allows either stack to be started first.
 ```
 
 This displays the Oracle container, shared network, TLS proxy, S3 hosts, bucket, credentials, DBMS_CLOUD credential, and CA trust path.
+It also reports the DBMS_CLOUD SSL wallet path and wallet synchronization mode.
 
 ---
 
@@ -560,6 +564,9 @@ Read CA from minio-s3-tls
 Install CA into Oracle Linux trust store
           |
           v
+Synchronize DBMS_CLOUD SSL wallet
+          |
+          v
 Resolve minio / warehouse.minio
           |
           v
@@ -581,6 +588,18 @@ and installed at:
 The script runs `update-ca-trust` when available.
 
 No host-mounted CA file is required for this exchange.
+
+The same local CA must also be trusted by the database-managed `DBMS_CLOUD` request path. Container OS trust is enough for tools such as `curl`, but it is not always enough for `DBMS_CLOUD.LIST_OBJECTS`.
+
+For this local ADB-Free lab, the script checks the DBMS_CLOUD SSL wallet at:
+
+```text
+/u01/app/oracle/wallets/ssl_wallet
+```
+
+If the wallet already contains the local MinIO CA, no change is made. If `ORACLE_SSL_WALLET_PASSWORD` is provided, the script attempts to add the CA to the existing wallet. Otherwise, the default `replace` mode backs up the original wallet inside the container and creates a local demo auto-login wallet containing the generated MinIO CA.
+
+Use this replacement behavior only for disposable local labs. Set `ORACLE_DATALAKE_DBMS_CLOUD_WALLET_MODE=skip` if you want to manage DBMS_CLOUD certificate trust yourself.
 
 ---
 
@@ -627,10 +646,11 @@ or rerun:
 This is the end-to-end database integration test. It:
 
 1. Ensures container-level data-lake connectivity.
-2. Ensures the configured application user exists.
-3. Adds an outbound network ACL for `warehouse.minio`.
-4. Creates or refreshes `DATALAKE_S3_CRED` using the configured MinIO access key and secret key.
-5. Executes `DBMS_CLOUD.LIST_OBJECTS` against `s3://warehouse.minio/` and displays up to 20 objects.
+2. Ensures the MinIO CA is trusted by the DBMS_CLOUD SSL wallet.
+3. Ensures the configured application user exists.
+4. Adds an outbound network ACL for `warehouse.minio`.
+5. Creates or refreshes `DATALAKE_S3_CRED` using the configured MinIO access key and secret key.
+6. Executes `DBMS_CLOUD.LIST_OBJECTS` against `s3://warehouse.minio/` and displays up to 20 objects.
 
 A successful `datalakeDB` run verifies substantially more than container-level connectivity because the S3 request originates from inside Oracle Database.
 
@@ -646,7 +666,7 @@ BEGIN
         host => 'warehouse.minio',
         ace  => xs$ace_type(
                     privilege_list => xs$name_list('http'),
-                    principal_name => 'WORKBENCH',
+                    principal_name => 'MATT',
                     principal_type => xs_acl.ptype_db
                 ),
         private_target => TRUE
@@ -697,6 +717,11 @@ These are development defaults from the local lab. Do not reuse them for product
 | `ORACLE_DATALAKE_SECRET_KEY` | MinIO secret key | `password` |
 | `ORACLE_DATALAKE_CREDENTIAL` | DBMS_CLOUD credential name | `DATALAKE_S3_CRED` |
 | `ORACLE_DATALAKE_CA_PROXY_PATH` | CA path inside `minio-s3-tls` | `/etc/nginx/tls/ca.crt` |
+| `ORACLE_DATALAKE_DBMS_CLOUD_WALLET` | DBMS_CLOUD SSL wallet path | `/u01/app/oracle/wallets/ssl_wallet` |
+| `ORACLE_DATALAKE_DBMS_CLOUD_WALLET_MODE` | DBMS_CLOUD wallet sync mode: `replace` or `skip` | `replace` |
+| `ORACLE_DATALAKE_DBMS_CLOUD_WALLET_PASSWORD` | Password for a replacement demo wallet | `Welcome1234!Welcome1234!` |
+| `ORACLE_DATALAKE_DBMS_CLOUD_CA_SUBJECT` | Subject used to detect the local CA in the wallet | `CN=Oracle Data Lake Local CA` |
+| `ORACLE_SSL_WALLET_PASSWORD` | Optional password for updating the existing SSL wallet instead of replacing it | unset |
 
 Example:
 
@@ -740,7 +765,7 @@ ADMIN_PASSWORD="Welcome1234!"
 WALLET_PASSWORD="Welcome1234!"
 WORKLOAD_TYPE="ATP"
 
-DB_USER="workbench"
+DB_USER="matt"
 DB_USER_PASSWORD="Welcome1234!"
 ```
 

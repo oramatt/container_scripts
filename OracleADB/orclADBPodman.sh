@@ -122,6 +122,10 @@ DATALAKE_CREDENTIAL="${ORACLE_DATALAKE_CREDENTIAL:-DATALAKE_S3_CRED}"
 DATALAKE_CA_PROXY_PATH="${ORACLE_DATALAKE_CA_PROXY_PATH:-/etc/nginx/tls/ca.crt}"
 DATALAKE_CA_TMP_PATH="/tmp/oracle-datalake-ca.crt"
 DATALAKE_CA_CONTAINER_PATH="/etc/pki/ca-trust/source/anchors/oracle-datalake-ca.crt"
+DATALAKE_DBMS_CLOUD_WALLET="${ORACLE_DATALAKE_DBMS_CLOUD_WALLET:-/u01/app/oracle/wallets/ssl_wallet}"
+DATALAKE_DBMS_CLOUD_WALLET_MODE="${ORACLE_DATALAKE_DBMS_CLOUD_WALLET_MODE:-replace}"
+DATALAKE_DBMS_CLOUD_WALLET_PASSWORD="${ORACLE_DATALAKE_DBMS_CLOUD_WALLET_PASSWORD:-Welcome1234!Welcome1234!}"
+DATALAKE_DBMS_CLOUD_CA_SUBJECT="${ORACLE_DATALAKE_DBMS_CLOUD_CA_SUBJECT:-CN=Oracle Data Lake Local CA}"
 
 # Uncomment on Apple Silicon / ARM if needed
 # PLATFORM="linux/amd64"
@@ -202,6 +206,64 @@ dataLakeTLSContainerRunning() {
     podman ps --format "{{.Names}}" | grep -q "^${DATALAKE_TLS_CONTAINER}$"
 }
 
+syncDataLakeDBMSCloudWallet() {
+    local java_home
+
+    if [[ "${DATALAKE_DBMS_CLOUD_WALLET_MODE}" == "skip" ]]; then
+        logWarn "Skipped DBMS_CLOUD SSL wallet synchronization."
+        return 0
+    fi
+
+    java_home="$(podman exec "${CONTAINER_NAME}" sh -lc \
+        'if [ -x "$JAVA_HOME/bin/java" ]; then dirname "$(dirname "$JAVA_HOME/bin/java")"; else java_bin="$(find /usr /u01 -type f -name java 2>/dev/null | head -1)"; if [ -n "$java_bin" ]; then dirname "$(dirname "$java_bin")"; fi; fi' \
+        2>/dev/null)"
+
+    if [[ -z "${java_home}" ]]; then
+        logWarn "Java was not found in ${CONTAINER_NAME}; skipped DBMS_CLOUD SSL wallet synchronization."
+        return 1
+    fi
+
+    if podman exec --user oracle "${CONTAINER_NAME}" sh -lc \
+        "export JAVA_HOME='${java_home}'; orapki wallet display -wallet '${DATALAKE_DBMS_CLOUD_WALLET}' 2>/dev/null | grep -F '${DATALAKE_DBMS_CLOUD_CA_SUBJECT}' >/dev/null"; then
+        logInfo "MinIO CA is already present in the DBMS_CLOUD SSL wallet."
+        return 0
+    fi
+
+    if [[ -n "${ORACLE_SSL_WALLET_PASSWORD:-}" ]]; then
+        if podman exec --user oracle "${CONTAINER_NAME}" sh -lc \
+            "export JAVA_HOME='${java_home}'; orapki wallet add -wallet '${DATALAKE_DBMS_CLOUD_WALLET}' -trusted_cert -cert '${DATALAKE_CA_TMP_PATH}' -pwd '${ORACLE_SSL_WALLET_PASSWORD}'"; then
+            logInfo "MinIO CA added to the DBMS_CLOUD SSL wallet."
+            return 0
+        fi
+        logWarn "Could not update the existing DBMS_CLOUD SSL wallet with ORACLE_SSL_WALLET_PASSWORD."
+    fi
+
+    if [[ "${DATALAKE_DBMS_CLOUD_WALLET_MODE}" != "replace" ]]; then
+        logWarn "DBMS_CLOUD SSL wallet does not trust the MinIO CA."
+        logWarn "Set ORACLE_SSL_WALLET_PASSWORD or ORACLE_DATALAKE_DBMS_CLOUD_WALLET_MODE=replace."
+        return 1
+    fi
+
+    logWarn "Replacing ${DATALAKE_DBMS_CLOUD_WALLET} with a local demo wallet for DBMS_CLOUD MinIO TLS."
+    logWarn "The original wallet is backed up in the Oracle container before replacement."
+
+    if podman exec --user oracle "${CONTAINER_NAME}" sh -lc \
+        "set -e
+         export JAVA_HOME='${java_home}'
+         backup='${DATALAKE_DBMS_CLOUD_WALLET}.before-datalake.'\$(date +%Y%m%d%H%M%S)
+         cp -a '${DATALAKE_DBMS_CLOUD_WALLET}' \"\${backup}\"
+         rm -f '${DATALAKE_DBMS_CLOUD_WALLET}'/cwallet.sso '${DATALAKE_DBMS_CLOUD_WALLET}'/ewallet.p12 '${DATALAKE_DBMS_CLOUD_WALLET}'/*.lck
+         orapki wallet create -wallet '${DATALAKE_DBMS_CLOUD_WALLET}' -pwd '${DATALAKE_DBMS_CLOUD_WALLET_PASSWORD}' -auto_login
+         orapki wallet add -wallet '${DATALAKE_DBMS_CLOUD_WALLET}' -trusted_cert -cert '${DATALAKE_CA_TMP_PATH}' -pwd '${DATALAKE_DBMS_CLOUD_WALLET_PASSWORD}'
+         echo \"DBMS_CLOUD wallet backup: \${backup}\""; then
+        logInfo "MinIO CA installed in the DBMS_CLOUD SSL wallet."
+        return 0
+    fi
+
+    logError "Failed to synchronize the DBMS_CLOUD SSL wallet."
+    return 1
+}
+
 syncDataLakeCA() {
     requirePodman
 
@@ -244,6 +306,8 @@ syncDataLakeCA() {
         logWarn "update-ca-trust is unavailable; CA remains at ${DATALAKE_CA_TMP_PATH}."
         return 1
     fi
+
+    syncDataLakeDBMSCloudWallet || return 1
 }
 
 showDataLakeInfo() {
@@ -261,6 +325,8 @@ showDataLakeInfo() {
     echo "Secret Key             : ${DATALAKE_SECRET_KEY}"
     echo "DBMS_CLOUD Credential  : ${DATALAKE_CREDENTIAL}"
     echo "CA Trust Path          : ${DATALAKE_CA_CONTAINER_PATH}"
+    echo "DBMS_CLOUD Wallet      : ${DATALAKE_DBMS_CLOUD_WALLET}"
+    echo "DBMS_CLOUD Wallet Mode : ${DATALAKE_DBMS_CLOUD_WALLET_MODE}"
     echo
 }
 
